@@ -66,20 +66,27 @@ class ActorCritic(nn.Module):
                 actor_layers.append(activation)
         self.actor = nn.Sequential(*actor_layers)
 
-        # Value function
-        critic_layers = []
-        critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
-        critic_layers.append(activation)
+        # Value functions
+        critic_layers_1, critic_layers_2 = [], []
+        critic_layers_1.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
+        critic_layers_2.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
+        critic_layers_1.append(activation)
+        critic_layers_2.append(activation)
         for l in range(len(critic_hidden_dims)):
             if l == len(critic_hidden_dims) - 1:
-                critic_layers.append(nn.Linear(critic_hidden_dims[l], 1))
+                critic_layers_1.append(nn.Linear(critic_hidden_dims[l], 1))
+                critic_layers_2.append(nn.Linear(critic_hidden_dims[l], 1))
             else:
-                critic_layers.append(nn.Linear(critic_hidden_dims[l], critic_hidden_dims[l + 1]))
-                critic_layers.append(activation)
-        self.critic = nn.Sequential(*critic_layers)
+                critic_layers_1.append(nn.Linear(critic_hidden_dims[l], critic_hidden_dims[l + 1]))
+                critic_layers_2.append(nn.Linear(critic_hidden_dims[l], critic_hidden_dims[l + 1]))
+                critic_layers_1.append(activation)
+                critic_layers_2.append(activation)
+        self.critic_1 = nn.Sequential(*critic_layers_1)
+        self.critic_2 = nn.Sequential(*critic_layers_2)
 
-        print(f"Actor MLP: {self.actor}")
-        print(f"Critic MLP: {self.critic}")
+        # print(f"Actor MLP: {self.actor}")
+        # print(f"Critic 1 MLP: {self.critic_1}")
+        # print(f"Critic 2 MLP: {self.critic_2}")
 
         # Action noise
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
@@ -132,8 +139,9 @@ class ActorCritic(nn.Module):
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
-        value = self.critic(critic_observations)
-        return value
+        value_1 = self.critic_1(critic_observations)
+        value_2 = self.critic_2(critic_observations)
+        return value_1, value_2
 
 def get_activation(act_name):
     if act_name == "elu":
