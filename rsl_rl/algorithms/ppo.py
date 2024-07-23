@@ -31,6 +31,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import math
 
 from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage
@@ -52,6 +53,9 @@ class PPO:
                  schedule="fixed",
                  desired_kl=0.01,
                  device='cpu',
+                 nom_rep_split=1.0,
+                 rep_coef=0.1,
+                 rep_bandwidth=0.01
                  ):
 
         self.device = device
@@ -63,7 +67,8 @@ class PPO:
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
-        self.storage = None # initialized later
+        self.storage = None  # initialized later
+        self.storage_rep = None  # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
 
@@ -78,12 +83,22 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
+        # Diversity parameters
+        self.nom_rep_split = nom_rep_split
+        self.has_div_loss = False if nom_rep_split == 1.0 else True
+        self.rep_coef = rep_coef
+        self.rep_bandwidth = rep_bandwidth
+
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
-        self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
+        num_nom_envs = math.ceil(num_envs * self.nom_rep_split)
+        num_rep_envs = num_envs - num_nom_envs
+        self.storage = RolloutStorage(num_nom_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
+        if self.has_div_loss:
+            self.storage_rep = RolloutStorage(num_rep_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
 
     def test_mode(self):
         self.actor_critic.test()
-    
+
     def train_mode(self):
         self.actor_critic.train()
 
@@ -101,8 +116,9 @@ class PPO:
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
         return self.transition.actions
-    
-    def process_env_step(self, rewards, dones, infos):
+
+    def process_env_step(self, next_obs, rewards, dones, infos):
+        self.transition.observations_next = next_obs
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         # Bootstrapping on time outs
@@ -110,81 +126,123 @@ class PPO:
             self.transition.rewards += self.gamma * torch.squeeze(self.transition.values * infos['time_outs'].unsqueeze(1).to(self.device), 1)
 
         # Record the transition
-        self.storage.add_transitions(self.transition)
+        if self.has_div_loss:
+            transition_nom, transition_rep = self.separate_transitions(self.storage.num_envs)
+            self.storage.add_transitions_dict(transition_nom)
+            self.storage_rep.add_transitions_dict(transition_rep)
+        else:
+            self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.actor_critic.reset(dones)
-    
+
+    def separate_transitions(self, num_envs):
+        nom_wanted_part, rep_wanted_part = {}, {}
+        for attr_name, attr_value in vars(self.transition).items():
+            if isinstance(attr_value, torch.Tensor):
+                nom_wanted_part[attr_name] = attr_value[:num_envs]
+                rep_wanted_part[attr_name] = attr_value[num_envs:]
+        return nom_wanted_part, rep_wanted_part
+
     def compute_returns(self, last_critic_obs):
+        nom_envs = self.storage.num_envs
         last_values_1, last_values_2 = self.actor_critic.evaluate(last_critic_obs)
-        last_values = torch.min(last_values_1, last_values_2).detach()
-        self.storage.compute_returns(last_values, self.gamma, self.lam)
+        last_values_1_nom, last_values_2_nom = last_values_1[:nom_envs], last_values_2[:nom_envs]
+        last_values_nom = torch.min(last_values_1_nom, last_values_2_nom).detach()
+        self.storage.compute_returns(last_values_nom, self.gamma, self.lam)
+        if self.has_div_loss:
+            last_values_1_rep, last_values_2_rep = last_values_1[nom_envs:], last_values_2[nom_envs:]
+            last_values_rep = torch.min(last_values_1_rep, last_values_2_rep).detach()
+            self.storage_rep.compute_returns(last_values_rep, self.gamma, self.lam)
 
     def update(self):
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_diversity_loss = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            if self.has_div_loss:
+                generator_rep = self.storage_rep.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
+            if self.has_div_loss:
+                generator_rep = self.storage_rep.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        for obs_batch, _, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
+                old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch in generator:
 
+            self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+            value_batch_1, value_batch_2 = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = torch.min(value_batch_1, value_batch_2)
+            mu_batch = self.actor_critic.action_mean
+            sigma_batch = self.actor_critic.action_std
+            entropy_batch = self.actor_critic.entropy
 
-                self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-                value_batch_1, value_batch_2 = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
-                value_batch = torch.min(value_batch_1, value_batch_2)
-                mu_batch = self.actor_critic.action_mean
-                sigma_batch = self.actor_critic.action_std
-                entropy_batch = self.actor_critic.entropy
+            # KL
+            if self.desired_kl != None and self.schedule == 'adaptive':
+                with torch.inference_mode():
+                    kl = torch.sum(torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
+                    kl_mean = torch.mean(kl)
 
-                # KL
-                if self.desired_kl != None and self.schedule == 'adaptive':
-                    with torch.inference_mode():
-                        kl = torch.sum(
-                            torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
-                        kl_mean = torch.mean(kl)
+                    if kl_mean > self.desired_kl * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-                        
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = self.learning_rate
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = self.learning_rate
 
+            # Surrogate loss
+            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            surrogate = -torch.squeeze(advantages_batch) * ratio
+            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-                # Surrogate loss
-                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-                surrogate = -torch.squeeze(advantages_batch) * ratio
-                surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(ratio, 1.0 - self.clip_param,
-                                                                                1.0 + self.clip_param)
-                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # Value function loss
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param, self.clip_param)
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (returns_batch - value_batch).pow(2).mean()
 
-                # Value function loss
-                if self.use_clipped_value_loss:
-                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param,
-                                                                                                    self.clip_param)
-                    value_losses = (value_batch - returns_batch).pow(2)
-                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
-                else:
-                    value_loss = (returns_batch - value_batch).pow(2).mean()
+            diversity_loss = self.calculate_div_loss(next(generator_rep)) if self.has_div_loss else 0
 
-                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + self.rep_coef * diversity_loss
 
-                # Gradient step
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+            # Gradient step
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()
 
-                mean_value_loss += value_loss.item()
-                mean_surrogate_loss += surrogate_loss.item()
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            if self.has_div_loss:
+                mean_diversity_loss += diversity_loss.item()
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_diversity_loss /= num_updates
         self.storage.clear()
+        if self.has_div_loss:
+            self.storage_rep.clear()
 
-        return mean_value_loss, mean_surrogate_loss
+        return mean_value_loss, mean_surrogate_loss, mean_diversity_loss
+
+    def calculate_div_loss(self, sample):
+        (obs_batch, obs_next_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch,
+         old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch) = sample
+        value_batch_1, value_batch_2 = self.actor_critic.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+        current_q = torch.min(value_batch_1, value_batch_2)
+
+        next_value_batch_1, next_value_batch_2 = self.actor_critic.evaluate(obs_next_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+        next_q = torch.min(next_value_batch_1, next_value_batch_2)
+
+        immediate_rewards = returns_batch - advantages_batch  # Extract rewards from returns and advantages
+        target_q = immediate_rewards + self.gamma * next_q
+
+        diversity_loss = torch.mean(torch.exp(-(current_q - target_q) ** 2 / (2 * self.rep_bandwidth ** 2)))
+
+        return diversity_loss
