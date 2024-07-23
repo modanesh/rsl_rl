@@ -35,7 +35,7 @@ import statistics
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
-
+import math
 from rsl_rl.algorithms import PPO
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
 from rsl_rl.env import VecEnv
@@ -57,9 +57,9 @@ class OnPolicyRunner:
         self.device = device
         self.env = env
         self.wandb = wandb
-        
+
         if self.env.num_privileged_obs is not None:
-            num_critic_obs = self.env.num_privileged_obs 
+            num_critic_obs = self.env.num_privileged_obs
         else:
             num_critic_obs = self.env.num_obs
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
@@ -69,10 +69,10 @@ class OnPolicyRunner:
                                                         **self.policy_cfg).to(self.device)
         alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
-        
+
         if self.wandb is not None:
             self.wandb.watch(self.alg.actor_critic, log="gradients", log_graph=False)
-        
+
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
@@ -86,7 +86,7 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
 
         _, _ = self.env.reset()
-    
+
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
@@ -99,8 +99,9 @@ class OnPolicyRunner:
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        num_nom_envs = math.ceil(self.env.num_envs * self.alg.nom_rep_split)
+        cur_reward_sum = torch.zeros(num_nom_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(num_nom_envs, dtype=torch.float, device=self.device)
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
 
@@ -113,15 +114,17 @@ class OnPolicyRunner:
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
-                    self.alg.process_env_step(rewards, dones, infos)
-                    
+                    self.alg.process_env_step(obs, rewards, dones, infos)
+
                     if self.log_dir is not None:
                         # Book keeping
                         if 'episode' in infos:
                             ep_infos.append(infos['episode'])
-                        cur_reward_sum += rewards
+                        rewards_nom = rewards[:num_nom_envs]
+                        cur_reward_sum += rewards_nom
                         cur_episode_length += 1
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        dones_nom = dones[:num_nom_envs]
+                        new_ids = (dones_nom > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -133,15 +136,15 @@ class OnPolicyRunner:
                 # Learning step
                 start = stop
                 self.alg.compute_returns(critic_obs)
-            
-            mean_value_loss, mean_surrogate_loss = self.alg.update()
+
+            mean_value_loss, mean_surrogate_loss, mean_diversity_loss = self.alg.update()
             stop = time.time()
             learn_time = stop - start
             self.log(locals())
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
-        
+
         self.current_learning_iteration += num_learning_iterations
         self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(self.current_learning_iteration)))
 
@@ -171,6 +174,7 @@ class OnPolicyRunner:
 
         wandb_log["Loss/value_function"] = locs["mean_value_loss"]
         wandb_log["Loss/surrogate"] = locs["mean_surrogate_loss"]
+        wandb_log["Loss/diversity"] = locs["mean_diversity_loss"]
         wandb_log["Loss/learning_rate"] = self.alg.learning_rate
         wandb_log["Policy/mean_noise_std"] = mean_std.item()
         wandb_log["Perf/total_fps"] = fps
@@ -196,6 +200,7 @@ class OnPolicyRunner:
                               'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Diversity loss:':>{pad}} {locs['mean_diversity_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
@@ -210,6 +215,7 @@ class OnPolicyRunner:
                               'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Diversity loss:':>{pad}} {locs['mean_diversity_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
