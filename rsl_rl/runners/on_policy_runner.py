@@ -104,13 +104,14 @@ class OnPolicyRunner:
         cur_episode_length = torch.zeros(num_nom_envs, dtype=torch.float, device=self.device)
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
-
         for it in trange(self.current_learning_iteration, tot_iter):
+            values_var_record = 0
             start = time.time()
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs)
+                    actions, values_var = self.alg.act(obs, critic_obs)
+                    values_var_record += values_var
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
@@ -139,6 +140,7 @@ class OnPolicyRunner:
 
             mean_value_loss, mean_surrogate_loss, mean_diversity_loss = self.alg.update()
             stop = time.time()
+            values_var_record /= self.num_steps_per_env
             learn_time = stop - start
             self.log(locals())
             if it % self.save_interval == 0:
@@ -172,6 +174,7 @@ class OnPolicyRunner:
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
+        wandb_log["Episode/value_variance"] = locs["values_var_record"]
         wandb_log["Loss/value_function"] = locs["mean_value_loss"]
         wandb_log["Loss/surrogate"] = locs["mean_surrogate_loss"]
         wandb_log["Loss/diversity"] = locs["mean_diversity_loss"]

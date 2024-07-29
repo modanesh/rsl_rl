@@ -109,13 +109,15 @@ class PPO:
         self.transition.actions = self.actor_critic.act(obs).detach()
         value_1, value_2 = self.actor_critic.evaluate(critic_obs)
         self.transition.values = torch.min(value_1, value_2).detach()
+        values_var = torch.mean(torch.var(torch.cat((value_1, value_2), dim=1), dim=1))
+        assert values_var >= 0, f"Negative variance: {values_var}"
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
-        return self.transition.actions
+        return self.transition.actions, values_var.item()
 
     def process_env_step(self, next_obs, rewards, dones, infos):
         self.transition.observations_next = next_obs
