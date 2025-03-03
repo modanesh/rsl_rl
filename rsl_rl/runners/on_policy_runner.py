@@ -72,6 +72,8 @@ class OnPolicyRunner:
 
         if self.wandb is not None:
             self.wandb.watch(self.alg.actor_critic, log="gradients", log_graph=False)
+            self.wandb.log({f"reward_scales/{k}": v for k, v in class_to_dict(self.env.cfg.rewards.scales).items()})
+            self.wandb.log({f"domain_rand/{k}": v for k, v in class_to_dict(self.env.cfg.domain_rand).items()})
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
@@ -255,4 +257,22 @@ class OnPolicyRunner:
         self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
         if device is not None:
             self.alg.actor_critic.to(device)
-        return self.alg.actor_critic.act_inference
+        return self.alg.actor_critic
+
+
+def class_to_dict(obj) -> dict:
+    if not  hasattr(obj,"__dict__"):
+        return obj
+    result = {}
+    for key in dir(obj):
+        if key.startswith("_"):
+            continue
+        element = []
+        val = getattr(obj, key)
+        if isinstance(val, list):
+            for item in val:
+                element.append(class_to_dict(item))
+        else:
+            element = class_to_dict(val)
+        result[key] = element
+    return result

@@ -54,8 +54,9 @@ class PPO:
                  desired_kl=0.01,
                  device='cpu',
                  nom_rep_split=1.0,
-                 rep_coef=0.1,
-                 rep_bandwidth=0.01
+                 with_rep=False,
+                 rep_lambda=0.1,
+                 rep_delta=0.01
                  ):
 
         self.device = device
@@ -85,9 +86,9 @@ class PPO:
 
         # Diversity parameters
         self.nom_rep_split = nom_rep_split
-        self.has_div_loss = False if nom_rep_split == 1.0 else True
-        self.rep_coef = rep_coef
-        self.rep_bandwidth = rep_bandwidth
+        self.has_div_loss = with_rep
+        self.rep_lambda = rep_lambda
+        self.rep_delta = rep_delta
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         num_nom_envs = math.ceil(num_envs * self.nom_rep_split)
@@ -210,7 +211,7 @@ class PPO:
 
             diversity_loss = self.calculate_div_loss(next(generator_rep)) if self.has_div_loss else 0
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + self.rep_coef * diversity_loss
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + self.rep_lambda * diversity_loss
 
             # Gradient step
             self.optimizer.zero_grad()
@@ -245,6 +246,6 @@ class PPO:
         immediate_rewards = returns_batch - advantages_batch  # Extract rewards from returns and advantages
         target_q = immediate_rewards + self.gamma * next_q
 
-        diversity_loss = torch.mean(torch.exp(-(current_q - target_q) ** 2 / (2 * self.rep_bandwidth ** 2)))
+        diversity_loss = torch.mean(torch.exp(-(current_q - target_q) ** 2 / (2 * self.rep_delta ** 2)))
 
         return diversity_loss
