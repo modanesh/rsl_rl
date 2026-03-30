@@ -40,7 +40,6 @@ class ActorCriticDrift(nn.Module):
             actor_layers.append(nn.Linear(actor_hidden_dims[i], actor_hidden_dims[i + 1]))
             actor_layers.append(activation_fn)
         actor_layers.append(nn.Linear(actor_hidden_dims[-1], self.a_dim))
-        actor_layers.append(nn.Tanh())  # bound to (-1, 1)
         self.actor = nn.Sequential(*actor_layers)
 
         critic_layers = []

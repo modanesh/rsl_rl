@@ -14,7 +14,7 @@ from rsl_rl.modules import ActorCriticDrift
 from rsl_rl.storage import RolloutStorage
 
 
-def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp=1.0):
+def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp=1.0, repel_coef=0.1, max_act=3.0):
     """
     Computes the Advantage-Weighted Mean-Shift Drift Field.
     x_gen: [B, Ngen, D] - Generated samples to construct the field
@@ -23,13 +23,9 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
     """
     B, Ngen, D = x_gen.shape
 
-    # Low-advantage states exert near-zero gravitational pull.
-    # (Advantages are already normalized in the update loop)
-    pos_adv = advantages.clamp(min=0)
-    attract_weight = (pos_adv / (pos_adv.max() + 1e-8)).unsqueeze(-1)
-
     # With a single positive sample per state, the kernel normalizes to 1.0, so it cancels.
     # Using normalized form directly preserves the anti-symmetry property.
+    attract_weight = (advantages / (advantages.abs().max() + 1e-8)).unsqueeze(-1)
     V_attract = attract_weight * (y_target - x_gen)
 
     # 2. Kernelized Repulsion V-(x)
@@ -46,7 +42,7 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
     V_repel = torch.sum(W_neg.unsqueeze(-1) * diff_neg, dim=2)  # [B, Ngen, D]
 
     # Total Drift Field
-    V = V_attract - V_repel
+    V = V_attract - repel_coef * V_repel
 
     # RMS normalization: stabilizes regression targets when field magnitude is erratic
     rms = (V.detach().pow(2).mean(dim=[1, 2], keepdim=True) + 1e-8).sqrt()
@@ -59,7 +55,7 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
         "drift_field_rms": rms.mean().item()
     }
 
-    return (x_gen + eta * V).clamp(-1, 1).detach(), metrics
+    return (x_gen + eta * V).clamp(-max_act, max_act).detach(), metrics
 
 
 class DriftPO:
@@ -118,6 +114,7 @@ class DriftPO:
         self.drift_eta = drift_eta
         self.drift_ngen = drift_ngen
         self.drift_batch_size = drift_batch_size
+        self.max_act = 3.0
         self.rnd = None
         self.symmetry = None
 
@@ -129,7 +126,7 @@ class DriftPO:
         )
 
     def act(self, obs, critic_obs):
-        self.transition.actions = self.policy.act(obs).detach().clamp(-1, 1)
+        self.transition.actions = self.policy.act(obs).detach().clamp(-self.max_act, self.max_act)
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         # Dummy tensors to satisfy RolloutStorage without breaking interface
         self.transition.actions_log_prob = torch.zeros(obs.shape[0], device=self.device)
@@ -213,7 +210,8 @@ class DriftPO:
                     y_target=y_target,
                     advantages=adv_b,
                     tau=self.drift_tau,
-                    eta=self.drift_eta
+                    eta=self.drift_eta,
+                    max_act=self.max_act
                 )
 
                 actor_loss = torch.nn.functional.mse_loss(x_gen, target_a)
