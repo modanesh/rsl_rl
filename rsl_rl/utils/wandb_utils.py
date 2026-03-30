@@ -23,6 +23,9 @@ class WandbSummaryWriter(SummaryWriter):
 
         # Get the run name
         run_name = os.path.split(log_dir)[-1]
+        # append the model name to the run name cfg agent_cfg.algorithm.class_name
+        run_name += f"_{cfg['agent_cfg']['algorithm']['class_name']}"
+
 
         try:
             project = cfg["wandb_project"]
