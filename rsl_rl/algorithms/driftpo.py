@@ -25,14 +25,15 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
 
     # Low-advantage states exert near-zero gravitational pull.
     # (Advantages are already normalized in the update loop)
-    attract_weight = torch.sigmoid(advantages / adv_temp).unsqueeze(-1)  # [B, 1, 1]
+    attract_weight = (advantages / (advantages.abs().max() + 1e-8)).unsqueeze(-1)
 
-    disp_to_pos = y_target - x_gen  # [B, Ngen, D]
-    V_attract = attract_weight * disp_to_pos
+    # With a single positive sample per state, the kernel normalizes to 1.0, so it cancels.
+    # Using normalized form directly preserves the anti-symmetry property.
+    V_attract = attract_weight * (y_target - x_gen)
 
     # 2. Kernelized Repulsion V-(x)
     # Repels generated actions from each other to maintain multimodality
-    diff_neg = x_gen.unsqueeze(2) - x_gen.unsqueeze(1)  # [B, Ngen, Ngen, D]
+    diff_neg = x_gen.unsqueeze(1) - x_gen.unsqueeze(2)  # x_j - x_i (toward others)
     dist_neg = torch.norm(diff_neg, p=2, dim=-1)  # [B, Ngen, Ngen]
 
     mask = torch.eye(Ngen, device=x_gen.device).unsqueeze(0).bool()
@@ -46,8 +47,18 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
     # Total Drift Field
     V = V_attract - V_repel
 
-    # Regression target is the current state + Drift
-    return (x_gen + eta * V).detach()
+    # RMS normalization: stabilizes regression targets when field magnitude is erratic
+    rms = (V.detach().pow(2).mean(dim=[1, 2], keepdim=True) + 1e-8).sqrt()
+    V = V / rms
+
+    # Extract magnitudes for logging (using .item() to detach and store as floats)
+    metrics = {
+        "drift_attract_mag": V_attract.norm(dim=-1).mean().item(),
+        "drift_repel_mag": V_repel.norm(dim=-1).mean().item(),
+        "drift_field_rms": rms.mean().item()
+    }
+
+    return (x_gen + eta * V).detach(), metrics
 
 
 class DriftPO:
@@ -68,6 +79,10 @@ class DriftPO:
             device="cpu",
             normalize_advantage_per_mini_batch=False,
             multi_gpu_cfg: dict | None = None,
+            drift_tau: float = 0.2,
+            drift_eta: float = 0.5,
+            drift_ngen: int = 4,
+            drift_batch_size: int = 512,
             **kwargs,
     ):
         self.device = device
@@ -98,9 +113,10 @@ class DriftPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
         # Drift Hyperparameters
-        self.drift_tau = 0.2
-        self.drift_eta = 1.0
-        self.drift_ngen = 16
+        self.drift_tau = drift_tau
+        self.drift_eta = drift_eta
+        self.drift_ngen = drift_ngen
+        self.drift_batch_size = drift_batch_size
         self.rnd = None
         self.symmetry = None
 
@@ -140,9 +156,15 @@ class DriftPO:
         )
 
     def update(self):
-        batch_size = 6144 * 4
-        mean_value_loss = 0
-        mean_actor_loss = 0
+        batch_size = self.drift_batch_size
+
+        # Initialize accumulators
+        mean_value_loss = 0.0
+        mean_actor_loss = 0.0
+        mean_attract_mag = 0.0
+        mean_repel_mag = 0.0
+        mean_field_rms = 0.0
+        total_batches = 0  # Track exact batch count for accurate averaging
 
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
@@ -184,7 +206,8 @@ class DriftPO:
                 x_gen = self.policy.act_multiple(obs_b, n_gen=self.drift_ngen)  # [B, Ngen, D]
                 y_target = actions_b.unsqueeze(1)  # [B, 1, D]
 
-                target_a = compute_drift_target(
+                # Unpack target and metrics
+                target_a, drift_metrics = compute_drift_target(
                     x_gen=x_gen,
                     y_target=y_target,
                     advantages=adv_b,
@@ -202,20 +225,32 @@ class DriftPO:
                 if self.is_multi_gpu:
                     self.reduce_parameters()
 
+                # Accumulate metrics
+                mean_value_loss += value_loss.item()
+                mean_actor_loss += actor_loss.item()
+                mean_attract_mag += drift_metrics["drift_attract_mag"]
+                mean_repel_mag += drift_metrics["drift_repel_mag"]
+                mean_field_rms += drift_metrics["drift_field_rms"]
+                total_batches += 1
+
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
-            mean_value_loss += value_loss.item()
-            mean_actor_loss += actor_loss.item()
+        # Average out by the actual number of sub-batches processed
+        mean_value_loss /= total_batches
+        mean_actor_loss /= total_batches
+        mean_attract_mag /= total_batches
+        mean_repel_mag /= total_batches
+        mean_field_rms /= total_batches
 
-        num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_actor_loss /= num_updates
         self.storage.clear()
 
         return {
             "value_function": mean_value_loss,
-            "drift_actor": mean_actor_loss,
+            "drift_actor_loss": mean_actor_loss, # Renamed slightly for clarity
+            "drift_attract_mag": mean_attract_mag,
+            "drift_repel_mag": mean_repel_mag,
+            "drift_field_rms": mean_field_rms,
         }
 
     def reduce_parameters(self):

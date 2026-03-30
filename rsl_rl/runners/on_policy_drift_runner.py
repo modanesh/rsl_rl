@@ -10,6 +10,7 @@ import statistics
 import time
 import torch
 from collections import deque
+from tqdm import trange
 
 import rsl_rl
 from rsl_rl.algorithms import PPO, DriftPO, Distillation
@@ -23,8 +24,6 @@ from rsl_rl.modules import (
     StudentTeacherRecurrent,
 )
 from rsl_rl.utils import store_code_state
-
-from rsl_rl.modules import ActorCriticDrift
 
 
 class OnPolicyDriftRunner:
@@ -73,7 +72,7 @@ class OnPolicyDriftRunner:
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticDrift | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs,  self.env.num_actions, device = self.device, **self.policy_cfg
+            num_obs, num_privileged_obs,  self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
         # resolve dimension of rnd gated state
@@ -96,6 +95,8 @@ class OnPolicyDriftRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
+        # print alg_class
+        print(f"[INFO] Initializing algorithm {alg_class.__name__} with policy {policy_class.__name__} on device {self.device}.")
         self.alg: PPO | DriftPO | Distillation = alg_class(policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         # store training configuration
@@ -170,7 +171,8 @@ class OnPolicyDriftRunner:
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
-        self.train_mode()  # switch to train mode (for dropout for example)
+
+        self.train_mode()
 
         # Book keeping
         ep_infos = []
@@ -196,18 +198,15 @@ class OnPolicyDriftRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
-        for it in range(start_iter, tot_iter):
+        for it in trange(start_iter, tot_iter):
             start = time.time()
             # Rollout
-            with torch.no_grad():
+            with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    with torch.enable_grad():
-                        actions = self.alg.act(obs, privileged_obs)
-
+                    actions = self.alg.act(obs, privileged_obs)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # perform normalization
@@ -292,6 +291,7 @@ class OnPolicyDriftRunner:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
+        print("\n[DEBUG] loss_dict keys:", locs["loss_dict"].keys())
         # Compute the collection size
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
         # Update total time-steps and time
@@ -325,9 +325,15 @@ class OnPolicyDriftRunner:
         mean_std = self.alg.policy.action_std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
-        # -- Losses
+        # -- Losses and Metrics (Routed for Wandb/Tensorboard)
         for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+            # If it's a drift magnitude/rms metric, put it in a "Drift" panel
+            if "mag" in key or "rms" in key:
+                self.writer.add_scalar(f"Drift/{key}", value, locs["it"])
+            # Otherwise, keep it in the "Loss" panel
+            else:
+                self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
         # -- Policy
@@ -359,7 +365,7 @@ class OnPolicyDriftRunner:
         if len(locs["rewbuffer"]) > 0:
             log_string = (
                 f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
+                f"""{''.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
@@ -392,11 +398,16 @@ class OnPolicyDriftRunner:
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
             f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-            f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
-            f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] - locs['start_iter'] + 1) * (
-                locs['start_iter'] + locs['num_learning_iterations'] - locs['it']):.1f}s\n"""
+            f"""{'Time elapsed:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
+            f"""{'ETA:':>{pad}} {time.strftime(
+                "%H:%M:%S",
+                time.gmtime(
+                    self.tot_time / (locs['it'] - locs['start_iter'] + 1)
+                    * (locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])
+                )
+            )}\n"""
         )
-        print(log_string)
+        # print(log_string)
 
     def save(self, path: str, infos=None):
         # -- Save model
@@ -519,16 +530,20 @@ class OnPolicyDriftRunner:
 
         # check if user has device specified for local rank
         if self.device != f"cuda:{self.gpu_local_rank}":
-            raise ValueError(f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'.")
+            raise ValueError(
+                f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
+            )
         # validate multi-gpu configuration
         if self.gpu_local_rank >= self.gpu_world_size:
-            raise ValueError(f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+            raise ValueError(
+                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
         if self.gpu_global_rank >= self.gpu_world_size:
-            raise ValueError(f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+            raise ValueError(
+                f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
 
         # initialize torch distributed
-        torch.distributed.init_process_group(
-            backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size
-        )
+        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)

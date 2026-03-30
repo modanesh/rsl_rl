@@ -20,7 +20,7 @@ class ActorCriticDrift(nn.Module):
         actor_hidden_dims: list = [512, 512, 256],
         critic_hidden_dims: list = [512, 512, 256],
         activation="elu",
-        device=torch.device("cpu"),
+        device=torch.device("cuda"),
         **kwargs,
     ):
         super().__init__()
@@ -32,9 +32,6 @@ class ActorCriticDrift(nn.Module):
         self.device = device
         self.last_log_probs = None # Kept for compatibility with rsl_rl storage
 
-        # ------------------------------------------------------------------
-        # ACTOR: Implicit Generator a = f(s, z)
-        # ------------------------------------------------------------------
         actor_layers = []
         actor_input_dim = self.a_o_dim + self.a_dim  # obs + noise
         actor_layers.append(nn.Linear(actor_input_dim, actor_hidden_dims[0]))
@@ -45,9 +42,6 @@ class ActorCriticDrift(nn.Module):
         actor_layers.append(nn.Linear(actor_hidden_dims[-1], self.a_dim))
         self.actor = nn.Sequential(*actor_layers)
 
-        # ------------------------------------------------------------------
-        # CRITIC: Standard Value Function V(s)
-        # ------------------------------------------------------------------
         critic_layers = []
         critic_layers.append(nn.Linear(self.c_o_dim, critic_hidden_dims[0]))
         critic_layers.append(activation_fn)
