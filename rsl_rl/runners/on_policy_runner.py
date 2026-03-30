@@ -21,7 +21,6 @@ from rsl_rl.modules import (
     EmpiricalNormalization,
     StudentTeacher,
     StudentTeacherRecurrent,
-    ActorCriticEmbodiment
 )
 from rsl_rl.utils import store_code_state
 
@@ -29,13 +28,12 @@ from rsl_rl.utils import store_code_state
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
-    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu", urdf_manager=None):
+    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
-        self.urdf_manager = urdf_manager
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -70,52 +68,11 @@ class OnPolicyRunner:
         else:
             num_privileged_obs = num_obs
 
-        # Add URDF parameters to policy config if URDF manager is provided
-        if urdf_manager is not None:
-            self.policy_cfg['urdf_feature_dim'] = urdf_manager.feature_dim
-            print(f"[INFO - PPO] URDF feature dimension: {urdf_manager.feature_dim}")
-
-            # Ensure urdf_mode is set
-            if 'urdf_mode' not in self.policy_cfg:
-                self.policy_cfg['urdf_mode'] = 'concat'  # default
-                print(f"[INFO - PPO] URDF mode not specified, defaulting to 'concat'")
-
-            print(f"[INFO - PPO] Using URDF mode: {self.policy_cfg['urdf_mode']}")
-        else:
-            # Ensure urdf_mode is 'none' if no manager
-            if 'urdf_mode' not in self.policy_cfg:
-                self.policy_cfg['urdf_mode'] = 'none'
-            if self.policy_cfg.get('urdf_mode', 'none') != 'none':
-                print(f"[WARNING - PPO] urdf_mode is set to '{self.policy_cfg['urdf_mode']}' but no urdf_manager provided. Setting to 'none'.")
-                self.policy_cfg['urdf_mode'] = 'none'
-
-        # Extract type_to_name_map if using URDF features
-        self.type_to_name_map = None
-        if urdf_manager is not None and self.policy_cfg.get('urdf_mode', 'none') != 'none':
-            self.type_to_name_map = urdf_manager.create_type_to_name_map()
-            print(f"[INFO - PPO] Created type_to_name_map: {self.type_to_name_map}")
-
-        # Determine which policy class to use
-        use_embodiment_policy = (
-                urdf_manager is not None and
-                self.policy_cfg.get('urdf_mode', 'none') != 'none'
-        )
-
-        if use_embodiment_policy:
-            # Force use of ActorCriticEmbodiment
-            if self.policy_cfg.get("class_name") != "ActorCriticEmbodiment":
-                print(f"[INFO - PPO] Switching policy from {self.policy_cfg.get('class_name', 'N/A')} to ActorCriticEmbodiment for URDF conditioning")
-                self.policy_cfg["class_name"] = "ActorCriticEmbodiment"
-
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent | ActorCriticEmbodiment = policy_class(
+        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
-
-        print(f"[INFO - PPO] Policy type: {type(policy).__name__}")
-        if isinstance(policy, ActorCriticEmbodiment):
-            print(f"[INFO - PPO] Policy URDF mode: {policy.urdf_mode}")
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -152,7 +109,6 @@ class OnPolicyRunner:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
 
-        urdf_feature_dim = urdf_manager.feature_dim if urdf_manager is not None else None
         # init storage and model
         self.alg.init_storage(
             self.training_type,
@@ -161,7 +117,6 @@ class OnPolicyRunner:
             [num_obs],
             [num_privileged_obs],
             [self.env.num_actions],
-            urdf_feature_dim=urdf_feature_dim
         )
 
         # Decide whether to disable logging
@@ -174,41 +129,6 @@ class OnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
-
-        quadruped_types = {
-            "anymal_d": 0,
-            "anymal_c": 1,
-            "anymal_b": 2,
-            "unitree_a1": 3,
-            "unitree_go1": 4,
-            "unitree_go2": 5,
-            "spot": 6,
-        }
-        self.quadruped_types = torch.zeros((self.env.num_envs, 1), device=self.device)
-        idx = 0
-        if hasattr(self.env.unwrapped, "robots"):
-            for robot, robot_articulation in self.env.unwrapped.robots.items():
-                self.quadruped_types[idx:idx + robot_articulation.num_instances] = quadruped_types[robot]
-                idx += robot_articulation.num_instances
-
-    def _get_urdf_features(self, infos):
-        """
-        Extract URDF features based on robot types from infos.
-
-        Args:
-            infos: Dictionary containing observations and other info from environment
-
-        Returns:
-            urdf_features: Tensor of shape [num_envs, urdf_feature_dim] or None
-        """
-        if self.urdf_manager is None or self.type_to_name_map is None:
-            return None
-
-        if self.policy_cfg.get('urdf_mode', 'none') == 'none':
-            return None
-
-        urdf_features = self.urdf_manager.get_features_by_type(self.quadruped_types, self.type_to_name_map)
-        return urdf_features
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
@@ -249,8 +169,6 @@ class OnPolicyRunner:
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
 
-        # Get initial URDF features and set them in the policy
-        urdf_features = self._get_urdf_features(extras)
         self.train_mode()
 
         # Book keeping
@@ -283,7 +201,7 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs, urdf_features=urdf_features)
+                    actions = self.alg.act(obs, privileged_obs)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -296,9 +214,6 @@ class OnPolicyRunner:
                         )
                     else:
                         privileged_obs = obs
-
-                    # Update URDF features for the policy
-                    urdf_features = self._get_urdf_features(infos)
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -341,7 +256,7 @@ class OnPolicyRunner:
 
                 # compute returns
                 if self.training_type == "rl":
-                    self.alg.compute_returns(privileged_obs, urdf_features=urdf_features)
+                    self.alg.compute_returns(privileged_obs)
 
             # update policy
             loss_dict = self.alg.update()

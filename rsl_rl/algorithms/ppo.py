@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic, ActorCriticEmbodiment
+from rsl_rl.modules import ActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -114,10 +114,9 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
-        self.is_embodiment_policy = isinstance(policy, ActorCriticEmbodiment)
 
     def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape, urdf_feature_dim=None
+        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
     ):
         # create memory for RND as well :)
         if self.rnd:
@@ -134,23 +133,15 @@ class PPO:
             actions_shape,
             rnd_state_shape,
             self.device,
-            urdf_feature_dim=urdf_feature_dim
         )
 
-    def act(self, obs, critic_obs, urdf_features=None):
+    def act(self, obs, critic_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
 
-        # Pass urdf_features to policy if it's an embodiment policy
-        if self.is_embodiment_policy:
-            self.transition.actions = self.policy.act(obs, urdf_features=urdf_features).detach()
-            self.transition.values = self.policy.evaluate(
-                critic_obs, urdf_features=urdf_features
-            ).detach()
-        else:
-            self.transition.actions = self.policy.act(obs).detach()
-            self.transition.values = self.policy.evaluate(critic_obs).detach()
-            self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.values = self.policy.evaluate(critic_obs).detach()
+        self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
 
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(
             self.transition.actions
@@ -160,10 +151,6 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
-
-        # Store URDF features in transition
-        if self.is_embodiment_policy and urdf_features is not None:
-            self.transition.urdf_features = urdf_features
 
         return self.transition.actions
 
@@ -196,12 +183,8 @@ class PPO:
         self.transition.clear()
         self.policy.reset(dones)
 
-    def compute_returns(self, last_critic_obs, urdf_features=None):
-        """Compute returns with optional URDF features."""
-        if self.is_embodiment_policy:
-            last_values = self.policy.evaluate(last_critic_obs, urdf_features=urdf_features).detach()
-        else:
-            last_values = self.policy.evaluate(last_critic_obs).detach()
+    def compute_returns(self, last_critic_obs):
+        last_values = self.policy.evaluate(last_critic_obs).detach()
 
         self.storage.compute_returns(
             last_values, self.gamma, self.lam,
@@ -231,11 +214,11 @@ class PPO:
 
         # Iterate over batches
         for batch_data in generator:
-            # Unpack batch data (INCLUDING urdf_features_batch at the end)
+            # Unpack batch data
             (obs_batch, critic_obs_batch, actions_batch, target_values_batch,
              advantages_batch, returns_batch, old_actions_log_prob_batch,
              old_mu_batch, old_sigma_batch, hid_states_batch, masks_batch,
-             rnd_state_batch, urdf_features_batch) = batch_data
+             rnd_state_batch) = batch_data
 
             original_batch_size = obs_batch.shape[0]
             num_aug = 1
@@ -269,17 +252,10 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            if self.is_embodiment_policy:
-                self.policy.act(obs_batch, urdf_features=urdf_features_batch,
-                                masks=masks_batch, hidden_states=hid_states_batch[0])
-                actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-                value_batch = self.policy.evaluate(critic_obs_batch, urdf_features=urdf_features_batch,
-                                                   masks=masks_batch, hidden_states=hid_states_batch[1])
-            else:
-                self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-                actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-                value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch,
-                                                   hidden_states=hid_states_batch[1])
+            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
+            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch,
+                                               hidden_states=hid_states_batch[1])
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]

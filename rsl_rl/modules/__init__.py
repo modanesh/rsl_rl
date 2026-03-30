@@ -11,7 +11,6 @@ from .normalizer import EmpiricalNormalization
 from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
-from .actor_critic_embodiment import ActorCriticEmbodiment
 
 __all__ = [
     "ActorCritic",
@@ -20,6 +19,5 @@ __all__ = [
     "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",
-    "ActorCriticEmbodiment",
 ]
 

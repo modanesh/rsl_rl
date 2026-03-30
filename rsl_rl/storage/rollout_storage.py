@@ -25,11 +25,9 @@ class RolloutStorage:
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
-            self.urdf_features = None
 
         def clear(self):
             self.__init__()
-            self.urdf_features = None
 
     def __init__(
         self,
@@ -41,7 +39,6 @@ class RolloutStorage:
         actions_shape,
         rnd_state_shape=None,
         device="cpu",
-        urdf_feature_dim=None
     ):
         # store inputs
         self.training_type = training_type
@@ -89,16 +86,6 @@ class RolloutStorage:
         # counter for the number of transitions stored
         self.step = 0
 
-        # Add URDF features storage
-        self.urdf_feature_dim = urdf_feature_dim
-        if urdf_feature_dim is not None:
-            self.urdf_features = torch.zeros(
-                num_transitions_per_env, num_envs, urdf_feature_dim,
-                device=device
-            )
-        else:
-            self.urdf_features = None
-
     def add_transitions(self, transition: Transition):
         # check if the transition is valid
         if self.step >= self.num_transitions_per_env:
@@ -126,9 +113,6 @@ class RolloutStorage:
         # For RND
         if self.rnd_state_shape is not None:
             self.rnd_state[self.step].copy_(transition.rnd_state)
-
-        if self.urdf_feature_dim is not None and transition.urdf_features is not None:
-            self.urdf_features[self.step].copy_(transition.urdf_features)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -224,10 +208,6 @@ class RolloutStorage:
         if self.rnd_state_shape is not None:
             rnd_state = self.rnd_state.flatten(0, 1)
 
-        # Flatten URDF features if they exist (CRITICAL)
-        if self.urdf_feature_dim is not None:
-            urdf_features_flat = self.urdf_features.flatten(0, 1)
-
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
@@ -249,18 +229,13 @@ class RolloutStorage:
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
 
-                if self.urdf_feature_dim is not None:
-                    urdf_features_batch = urdf_features_flat[batch_idx]
-                else:
-                    urdf_features_batch = None
-
                 # -- For RND
                 if self.rnd_state_shape is not None:
                     rnd_state_batch = rnd_state[batch_idx]
                 else:
                     rnd_state_batch = None
 
-                # Yield mini-batch (urdf_features_batch is LAST)
+                # Yield mini-batch
                 yield (
                     obs_batch,
                     privileged_observations_batch,
@@ -273,8 +248,7 @@ class RolloutStorage:
                     old_sigma_batch,
                     (None, None),  # hidden states for feedforward
                     None,  # masks
-                    rnd_state_batch,
-                    urdf_features_batch  # URDF features at the end
+                    rnd_state_batch
                 )
 
     # for reinfrocement learning with recurrent networks
@@ -291,14 +265,6 @@ class RolloutStorage:
             padded_rnd_state_trajectories, _ = split_and_pad_trajectories(self.rnd_state, self.dones)
         else:
             padded_rnd_state_trajectories = None
-
-        # Split URDF features trajectories if they exist
-        if self.urdf_feature_dim is not None:
-            padded_urdf_trajectories, _ = split_and_pad_trajectories(
-                self.urdf_features, self.dones
-            )
-        else:
-            padded_urdf_trajectories = None
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -322,12 +288,6 @@ class RolloutStorage:
                     rnd_state_batch = padded_rnd_state_trajectories[:, first_traj:last_traj]
                 else:
                     rnd_state_batch = None
-
-                # Extract URDF features batch
-                if padded_urdf_trajectories is not None:
-                    urdf_features_batch = padded_urdf_trajectories[:, first_traj:last_traj]
-                else:
-                    urdf_features_batch = None
 
                 # Extract other data (not split into trajectories)
                 actions_batch = self.actions[:, start:stop]
@@ -358,7 +318,7 @@ class RolloutStorage:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
-                # Yield mini-batch (urdf_features_batch at the end)
+                # Yield mini-batch
                 yield (
                     obs_batch,
                     privileged_obs_batch,
@@ -372,7 +332,6 @@ class RolloutStorage:
                     (hid_a_batch, hid_c_batch),
                     masks_batch,
                     rnd_state_batch,
-                    urdf_features_batch  # URDF features at the end
                 )
 
                 first_traj = last_traj
