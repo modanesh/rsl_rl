@@ -25,7 +25,8 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
 
     # Low-advantage states exert near-zero gravitational pull.
     # (Advantages are already normalized in the update loop)
-    attract_weight = (advantages / (advantages.abs().max() + 1e-8)).unsqueeze(-1)
+    pos_adv = advantages.clamp(min=0)
+    attract_weight = (pos_adv / (pos_adv.max() + 1e-8)).unsqueeze(-1)
 
     # With a single positive sample per state, the kernel normalizes to 1.0, so it cancels.
     # Using normalized form directly preserves the anti-symmetry property.
@@ -58,7 +59,7 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
         "drift_field_rms": rms.mean().item()
     }
 
-    return (x_gen + eta * V).detach(), metrics
+    return (x_gen + eta * V).clamp(-1, 1).detach(), metrics
 
 
 class DriftPO:
@@ -128,7 +129,7 @@ class DriftPO:
         )
 
     def act(self, obs, critic_obs):
-        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.actions = self.policy.act(obs).detach().clamp(-1, 1)
         self.transition.values = self.policy.evaluate(critic_obs).detach()
         # Dummy tensors to satisfy RolloutStorage without breaking interface
         self.transition.actions_log_prob = torch.zeros(obs.shape[0], device=self.device)
