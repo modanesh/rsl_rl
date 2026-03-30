@@ -291,7 +291,6 @@ class OnPolicyDriftRunner:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
-        print("\n[DEBUG] loss_dict keys:", locs["loss_dict"].keys())
         # Compute the collection size
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
         # Update total time-steps and time
