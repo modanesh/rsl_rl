@@ -20,5 +20,6 @@ __all__ = [
     "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",
-    "ActorCriticEmbodiment"
+    "ActorCriticEmbodiment",
 ]
+

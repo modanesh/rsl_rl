@@ -186,9 +186,10 @@ class OnPolicyRunner:
         }
         self.quadruped_types = torch.zeros((self.env.num_envs, 1), device=self.device)
         idx = 0
-        for robot, robot_articulation in self.env.unwrapped.robots.items():
-            self.quadruped_types[idx:idx + robot_articulation.num_instances] = quadruped_types[robot]
-            idx += robot_articulation.num_instances
+        if hasattr(self.env.unwrapped, "robots"):
+            for robot, robot_articulation in self.env.unwrapped.robots.items():
+                self.quadruped_types[idx:idx + robot_articulation.num_instances] = quadruped_types[robot]
+                idx += robot_articulation.num_instances
 
     def _get_urdf_features(self, infos):
         """
