@@ -50,7 +50,7 @@ def compute_drift_target(x_gen, y_target, advantages, tau=0.2, eta=1.0, adv_temp
     return (x_gen + eta * V).detach()
 
 
-class DriftPPO:
+class DriftPO:
     policy: ActorCriticDrift
 
     def __init__(
