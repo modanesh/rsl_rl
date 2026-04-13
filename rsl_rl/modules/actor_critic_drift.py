@@ -5,83 +5,120 @@
 
 from __future__ import annotations
 
+import copy
 import torch
 import torch.nn as nn
 from rsl_rl.utils import resolve_nn_activation
 
+
 class ActorCriticDrift(nn.Module):
+    """
+    Generative Actor-Critic for DriftPO.
+    """
+
     is_recurrent = False
 
     def __init__(
         self,
-        num_actor_obs,
-        num_critic_obs,
-        num_actions,
-        actor_hidden_dims: list = [512, 512, 256],
-        critic_hidden_dims: list = [512, 512, 256],
-        activation="elu",
+        num_actor_obs: int,
+        num_critic_obs: int,
+        num_actions: int,
+        actor_hidden_dims: list[int] = [512, 512, 256],
+        critic_hidden_dims: list[int] = [512, 512, 256],
+        q_hidden_dims: list[int] | None = None,  # defaults to critic_hidden_dims
+        activation: str = "elu",
         device=torch.device("cuda"),
         **kwargs,
     ):
         super().__init__()
-        activation_fn = resolve_nn_activation(activation)
-
         self.a_o_dim = num_actor_obs
         self.c_o_dim = num_critic_obs
-        self.a_dim = num_actions
-        self.device = device
-        self.last_log_probs = None # Kept for compatibility with rsl_rl storage
+        self.a_dim   = num_actions
+        self.device  = device
+        self.last_log_probs = None  # kept for RolloutStorage interface compatibility
 
-        actor_layers = []
-        actor_input_dim = self.a_o_dim + self.a_dim  # obs + noise
-        actor_layers.append(nn.Linear(actor_input_dim, actor_hidden_dims[0]))
-        actor_layers.append(activation_fn)
-        for i in range(len(actor_hidden_dims) - 1):
-            actor_layers.append(nn.Linear(actor_hidden_dims[i], actor_hidden_dims[i + 1]))
-            actor_layers.append(activation_fn)
-        actor_layers.append(nn.Linear(actor_hidden_dims[-1], self.a_dim))
-        self.actor = nn.Sequential(*actor_layers)
+        def make_mlp(input_dim: int, hidden_dims: list[int], output_dim: int) -> nn.Sequential:
+            """Utility: build a fully-connected MLP with the shared activation."""
+            layers: list[nn.Module] = []
+            in_d = input_dim
+            for h in hidden_dims:
+                layers += [nn.Linear(in_d, h), resolve_nn_activation(activation)]
+                in_d = h
+            layers.append(nn.Linear(in_d, output_dim))
+            return nn.Sequential(*layers)
 
-        critic_layers = []
-        critic_layers.append(nn.Linear(self.c_o_dim, critic_hidden_dims[0]))
-        critic_layers.append(activation_fn)
-        for i in range(len(critic_hidden_dims) - 1):
-            critic_layers.append(nn.Linear(critic_hidden_dims[i], critic_hidden_dims[i + 1]))
-            critic_layers.append(activation_fn)
-        critic_layers.append(nn.Linear(critic_hidden_dims[-1], 1))
-        self.critic = nn.Sequential(*critic_layers)
+        self.actor = make_mlp(
+            input_dim=self.a_o_dim + self.a_dim,  # obs concatenated with noise
+            hidden_dims=actor_hidden_dims,
+            output_dim=self.a_dim,
+        )
+
+        self.critic = make_mlp(
+            input_dim=self.c_o_dim,
+            hidden_dims=critic_hidden_dims,
+            output_dim=1,
+        )
+
+        q_dims = q_hidden_dims if q_hidden_dims is not None else critic_hidden_dims
+        self.q_network = make_mlp(
+            input_dim=self.c_o_dim + self.a_dim,  # obs concatenated with action
+            hidden_dims=q_dims,
+            output_dim=1,
+        )
+        self.q_target = copy.deepcopy(self.q_network)
+        for p in self.q_target.parameters():
+            p.requires_grad_(False)
 
         self.to(device)
 
     def reset(self, dones=None):
-        pass
+        pass  # no recurrent state
 
-    def act(self, observations, **kwargs):
-        """Standard rollout action (1-NFE)"""
+    def act(self, observations: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Single-sample action for environment rollout (1-NFE).
+        Returns: [B, D]
+        """
         z = torch.randn(observations.shape[0], self.a_dim, device=self.device)
-        action = self.actor(torch.cat([observations, z], dim=-1))
-        return action
+        return self.actor(torch.cat([observations, z], dim=-1))
 
-    def act_multiple(self, observations, n_gen=16):
-        """Generates multiple actions per state for computing the Drift Field"""
+    def act_multiple(self, observations: torch.Tensor, n_gen: int = 16) -> torch.Tensor:
         B = observations.shape[0]
-        z = torch.randn(B, n_gen, self.a_dim, device=self.device)
-        obs_rep = observations.unsqueeze(1).repeat(1, n_gen, 1)
-        actions = self.actor(torch.cat([obs_rep, z], dim=-1))
-        return actions
+        z       = torch.randn(B, n_gen, self.a_dim, device=self.device)
+        obs_rep = observations.unsqueeze(1).expand(-1, n_gen, -1)  # [B, n_gen, obs_dim]
+        return self.actor(torch.cat([obs_rep, z], dim=-1))         # [B, n_gen, D]
 
-    def act_inference(self, observations):
-        """Deterministic fallback for evaluation"""
+    def act_inference(self, observations: torch.Tensor) -> torch.Tensor:
+        """Deterministic action (zero noise). For evaluation / deployment only."""
         z = torch.zeros(observations.shape[0], self.a_dim, device=self.device)
         return self.actor(torch.cat([observations, z], dim=-1))
 
-    def evaluate(self, critic_observations, **kwargs):
+    def evaluate(self, critic_observations: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.critic(critic_observations)
 
+    def q_value(self, critic_observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        return self.q_network(torch.cat([critic_observations, actions], dim=-1))
+
+    def actor_critic_parameters(self) -> list[nn.Parameter]:
+        """Actor + V-Critic parameters for the main optimizer."""
+        return list(self.actor.parameters()) + list(self.critic.parameters())
+
+    def q_parameters(self) -> list[nn.Parameter]:
+        """Q-Network parameters for the Q-optimizer."""
+        return list(self.q_network.parameters())
+
+    def q_target_network(self) -> nn.Module:
+        return self.q_target
+
     @property
-    def action_std(self):
+    def action_std(self) -> torch.Tensor:
+        """
+        The implicit action std comes from the noise distribution N(0,I).
+        Return 0 here for logging compatibility with rsl_rl (which expects
+        a scalar representing the explicit Gaussian sigma of a Normal policy).
+        """
         return torch.tensor(0.0, device=self.device)
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict: bool = True):
         super().load_state_dict(state_dict, strict=strict)
         return True

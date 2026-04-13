@@ -8,5 +8,6 @@
 from .distillation import Distillation
 from .ppo import PPO
 from .driftpo import DriftPO
+from .sac import SAC
 
-__all__ = ["PPO", "Distillation", "DriftPO"]
+__all__ = ["PPO", "Distillation", "DriftPO", "SAC"]

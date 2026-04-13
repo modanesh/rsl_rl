@@ -202,6 +202,13 @@ class OnPolicyRunner:
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs)
+                    if self.log_dir is not None:
+                        if not hasattr(self, '_obs_log_buf'):
+                            self._obs_log_buf = []
+                        self._obs_log_buf.append(obs.detach().cpu())
+                        if not hasattr(self, '_action_log_buf'):
+                            self._action_log_buf = []
+                        self._action_log_buf.append(actions.detach().cpu())
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -328,6 +335,25 @@ class OnPolicyRunner:
 
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+
+        # -- Obs stats
+        if hasattr(self, '_obs_log_buf') and self._obs_log_buf:
+            stacked = torch.cat(self._obs_log_buf, dim=0)
+            self.writer.add_scalar("Obs/mean", stacked.mean().item(), locs["it"])
+            self.writer.add_scalar("Obs/std", stacked.std().item(), locs["it"])
+            self.writer.add_scalar("Obs/abs_max", stacked.abs().max().item(), locs["it"])
+            for i in range(stacked.shape[1]):
+                self.writer.add_scalar(f"ObsDim/dim_{i:03d}_mean", stacked[:, i].mean().item(), locs["it"])
+                self.writer.add_scalar(f"ObsDim/dim_{i:03d}_std", stacked[:, i].std().item(), locs["it"])
+            self._obs_log_buf.clear()
+
+        # -- Per-dim action stats
+        if hasattr(self, '_action_log_buf') and self._action_log_buf:
+            stacked = torch.cat(self._action_log_buf, dim=0)  # (steps*envs, num_actions)
+            for i in range(stacked.shape[1]):
+                self.writer.add_scalar(f"Actions/dim_{i:02d}_mean", stacked[:, i].mean().item(), locs["it"])
+                self.writer.add_scalar(f"Actions/dim_{i:02d}_std", stacked[:, i].std().item(), locs["it"])
+            self._action_log_buf.clear()
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
